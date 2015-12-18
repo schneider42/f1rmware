@@ -29,7 +29,9 @@
 #include <r0ketlib/menu.h>
 #include <r0ketlib/select.h>
 #include <r0ketlib/idle.h>
+#include <r0ketlib/config.h>
 
+#include <rad1olib/light_ws2812_cortex.h>
 #include <rad1olib/pins.h>
 
 #include <common/hackrf_core.h>
@@ -52,6 +54,7 @@
 
 #include "cossin1024.h"
 
+#include <string.h>
 // default to 2496 MHz
 #define FREQSTART 2496000000
 //#define FREQSTART 2100000000
@@ -678,19 +681,98 @@ static void receive() {
 
 /* ------------------------------------------------------------------- */
 
-void sendstring(char *str, uint16_t len) {
-    transmit((uint8_t*)str, len);
-    getInputWaitRelease();
+#define MAX_LED_FRAMES 50
+#define BUF_SIZE 3*8*MAX_LED_FRAMES+2
+
+unsigned char leds[BUF_SIZE];
+unsigned int frames = 0;
+unsigned int ctr = 0;
+unsigned int framectr = 0;
+
+void readRgbLedFile(void) {
+	int size = getFileSize(GLOBAL(ledfile));
+	frames = 0;
+	ctr = 0;
+	framectr = 0;
+	if(size > 0) {
+		if(size >= BUF_SIZE)
+			size = BUF_SIZE;
+		readFile(GLOBAL(ledfile), (char*)leds, size);
+		frames = (size-2)/(3*8);
+	}
+}
+
+/**************************************************************************/
+
+void senddata(uint8_t *data, uint16_t len) {
+    transmit(data, len);
     receive();
 }
 
+
+void init_rgbLeds(void) {
+	readTextFile("ledfile.cfg",GLOBAL(ledfile),FLEN);
+	readRgbLedFile();
+}
+
+void tx_rgbLeds(void) {
+	if(GLOBAL(rgbleds)) {
+		if(frames > 0) {
+			if(ctr == 0) {
+                senddata(&leds[framectr*3*8+2], 3*8);
+				framectr++;
+				if(framectr >= frames)
+					framectr = 0;
+			}
+
+			ctr++;
+			// LED delay is in leds[0:1]
+			if(ctr >= ((leds[0]<<8) + leds[1]))
+				ctr = 0;
+		}
+	}
+	return;
+}
+
+const uint8_t nleds = 8;
+
+void set_led(uint8_t *pattern, int index, uint8_t r, uint8_t g, uint8_t b)
+{
+    pattern[index*3+0] = r;
+    pattern[index*3+1] = g;
+    pattern[index*3+2] = b;
+}
+
+void animation_tx(void)
+{
+    tx_rgbLeds();
+}
+
+void set_all(uint8_t *pattern, uint8_t r, uint8_t g, uint8_t b)
+{
+    int i;
+    for(i = 0; i < nleds; i++) {
+        set_led(pattern, i, r, g, b);
+    }
+}
+
+
 //# MENU BPSK
 void bfsk_menu() {
+    uint8_t pattern[nleds * 3];
+    int i = 0;
+    int j = 0;
+
     lcdClear();
     lcdPrintln("ENTER to go back");
     lcdPrintln("L/R/U/D to xmit");
     lcdDisplay();
     getInputWaitRelease();
+
+    memset(pattern, 0, sizeof(pattern));
+    ws2812_sendarray(pattern, sizeof(pattern));
+
+    init_rgbLeds();
 
     cpu_clock_set(204);
 
@@ -701,25 +783,46 @@ void bfsk_menu() {
     while(1) {
         switch (getInputRaw()) {
             case BTN_UP:
-                sendstring("up", 2);
+                j = 1;
                 break;
             case BTN_DOWN:
-                sendstring("down", 4);
+                set_all(pattern, 0, 255, 0);
+                senddata(pattern, sizeof(pattern));
+                getInputWaitRelease();
+                j = 0;
                 break;
             case BTN_RIGHT:
-                sendstring("right", 5);
+                set_all(pattern, 0, 0, 255);
+                senddata(pattern, sizeof(pattern));
+                getInputWaitRelease();
+                j = 0;
                 break;
             case BTN_LEFT:
-                sendstring("left", 4);
+                set_all(pattern, 255, 0, 0);
+                senddata(pattern, sizeof(pattern));
+                getInputWaitRelease();
+                j = 0;
                 break;
             case BTN_ENTER:
                 goto stop;
         }
+        i += j;
+
+        if(i == 1000) {
+            animation_tx();
+            i = 0;
+        }
+
         if(rx_pkg_flag) {
             rx_pkg_flag = false;
-            rx_pkg[rx_pkg_len] = 0; /* ensure string termination */
-            lcdPrintln((char*)rx_pkg);
+            lcdPrint("RX: ");
+            lcdPrint(IntToStr(rx_pkg_len,5,F_LONG));lcdNl();
             lcdDisplay();
+            if(rx_pkg_len == sizeof(pattern)) {
+                baseband_streaming_disable();
+                ws2812_sendarray((uint8_t *)rx_pkg, rx_pkg_len);
+                baseband_streaming_enable();
+            }
         }
     }
 stop:
