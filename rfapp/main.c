@@ -11,7 +11,6 @@
 #include <r0ketlib/keyin.h>
 #include <r0ketlib/menu.h>
 #include <r0ketlib/config.h>
-#include <r0ketlib/config.h>
 
 #include <rad1olib/pins.h>
 #include <rad1olib/systick.h>
@@ -70,6 +69,8 @@ int main(void) {
 	SETUPgout(LED2);
 	SETUPgout(LED3);
 	SETUPgout(LED4);
+	SETUPpin(UART0_TXD);
+	SETUPpin(UART0_RXD);
 
 	inputInit();
 	lcdInit();
