@@ -42,6 +42,7 @@
 #include <common/streaming.h>
 #include <libopencm3/lpc43xx/sgpio.h>
 #include <libopencm3/lpc43xx/m4/nvic.h>
+#include <libopencm3/lpc43xx/uart.h>
 #include <libopencm3/cm3/vector.h>
 
 #include <stddef.h>
@@ -70,15 +71,19 @@ static void my_set_frequency(const int64_t new_frequency, const int32_t offset) 
 }
 
 static bool lna_enable = true;
-static bool txlna_enable = true;
-static int32_t lna_gain_db = 8;
+static bool txlna_enable = false;
+static int32_t lna_gain_db = 20;
 static int32_t vga_gain_db = 20;
 static int32_t txvga_gain_db = 30;
 
 /* set amps */
-static void set_rf_params() {
+static void set_rf_params(bool rx) {
     ssp1_set_mode_max2837(); // need to reset this since display driver will hassle with SSP1
-    rf_path_set_lna(lna_enable ? 1 : 0);
+    if(rx) {
+        rf_path_set_lna(lna_enable ? 1 : 0);
+    } else {
+        rf_path_set_lna(txlna_enable ? 1 : 0);
+    }
     max2837_set_lna_gain(lna_gain_db);     /* 8dB increments */
     max2837_set_vga_gain(vga_gain_db);     /* 2dB increments, up to 62dB */
     max2837_set_txvga_gain(txvga_gain_db); /* 1dB increments, up to 47dB */
@@ -125,7 +130,8 @@ static void rfinit() {
 /* ---------------------------- TRANSMIT: ------------------------------- */
 
 /* transmit options */
-#define TX_BANDWIDTH  3000000
+//#define TX_BANDWIDTH  3000000
+#define TX_BANDWIDTH  1750000
 #define TX_SAMPLERATE 4000000
 #define TX_FREQOFFSET (-62500)
 
@@ -298,6 +304,7 @@ static void transmit(uint8_t *data, uint16_t length) {
     vector_table.irq[NVIC_SGPIO_IRQ] = bfsk_sgpio_isr_tx;
     /* set up RF path */
     rf_path_set_direction(RF_PATH_DIRECTION_TX);
+    set_rf_params(false);
     /* set TX frequency */
     my_set_frequency(frequency, TX_FREQOFFSET);
     /* set TX sample rate */
@@ -665,6 +672,7 @@ static void receive() {
     vector_table.irq[NVIC_SGPIO_IRQ] = bfsk_sgpio_isr_rx;
     /* set up RF path */
     rf_path_set_direction(RF_PATH_DIRECTION_RX);
+    set_rf_params(true);
     /* set RX frequency */
     my_set_frequency(frequency, RX_FREQOFFSET);
     /* set TX sample rate */
@@ -756,6 +764,58 @@ void set_all(uint8_t *pattern, uint8_t r, uint8_t g, uint8_t b)
     }
 }
 
+void serial_handler(uint8_t data)
+{
+    static uint8_t buf[128];
+    static int index = 0;
+    static bool sync = false;
+    uint8_t pattern[nleds * 3];
+
+    buf[index] = data;
+
+    if(index == 1) {
+        if(buf[0] == '!' && buf[1] == '!') {
+            sync = true;
+        } else {
+            sync = false;
+            index = -1;
+        }
+    }
+
+    if(sync && index == 3) {
+        if((buf[2] >> 4) != 1 ||  buf[3] > 24) {
+            sync = false;
+            index = -1;
+        }
+    }
+
+    if(sync && index > 3) {
+        if(index == buf[3] + 4) {
+            if(buf[index] == '\r' || buf[index] == '\n') {
+                //lcdPrint("RGB: ");
+                //lcdPrint(IntToStr(buf[4],4,F_LONG));
+                //lcdPrint(IntToStr(buf[5],4,F_LONG));
+                //lcdPrintln(IntToStr(buf[6],4,F_LONG));
+                //lcdDisplay();
+
+                senddata(buf + 2, buf[3] + 2);
+
+                set_all(pattern, buf[5]/5, buf[4]/5, 0);
+                baseband_streaming_disable();
+                ws2812_sendarray(pattern, sizeof(pattern));
+                baseband_streaming_enable();
+            }
+            sync = false;
+            index = -1;
+        }
+    }
+
+    index += 1;
+    if(index == sizeof(buf)) {
+        index = 0;
+    }
+
+}
 
 //# MENU BPSK
 void bfsk_menu() {
@@ -777,7 +837,9 @@ void bfsk_menu() {
     cpu_clock_set(204);
 
     rfinit();
-    set_rf_params();
+
+    uart_init(UART0_NUM, UART_DATABIT_8, UART_STOPBIT_1, UART_PARITY_NONE, 111, 0, 1);
+   
     receive();
 
     while(1) {
@@ -811,18 +873,26 @@ void bfsk_menu() {
         if(i == 1000) {
             animation_tx();
             i = 0;
+            uart_write(UART0_NUM, 0xAA);
         }
 
         if(rx_pkg_flag) {
             rx_pkg_flag = false;
-            lcdPrint("RX: ");
-            lcdPrint(IntToStr(rx_pkg_len,5,F_LONG));lcdNl();
-            lcdDisplay();
-            if(rx_pkg_len == sizeof(pattern)) {
-                baseband_streaming_disable();
-                ws2812_sendarray((uint8_t *)rx_pkg, rx_pkg_len);
-                baseband_streaming_enable();
+            //lcdPrint("RX: ");
+            //lcdPrint(IntToStr(rx_pkg_len,5,F_LONG));lcdNl();
+            //lcdDisplay();
+            if(rx_pkg_len > 2 && rx_pkg[1] == rx_pkg_len - 2) {
+                if((rx_pkg[0] == 0x10 || 1) && rx_pkg[1] == 4) {
+                    set_all(pattern, rx_pkg[3], rx_pkg[2], rx_pkg[4]);
+                    baseband_streaming_disable();
+                    ws2812_sendarray(pattern, sizeof(pattern));
+                    baseband_streaming_enable();
+                }
             }
+        }
+        if(uart_rx_data_ready(UART0_NUM) == UART_RX_DATA_READY) {
+            uint8_t data = uart_read(UART0_NUM);
+            serial_handler(data);
         }
     }
 stop:
